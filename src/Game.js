@@ -77,7 +77,12 @@ PrinceJS.Game.prototype = {
         this.shadow = enemy;
       }
     }
-    let turn = json.prince.turn !== false;
+    // При загрузке сохранения не разворачиваем персонажа анимацией turn:
+    // applySave() сам выставит сохранённое направление через changeFace(),
+    // а отложенный "turn" через 100 мс перевернул бы его ещё раз —
+    // из-за этого персонаж начинал ходить "спиной".
+    let isLoad = !!PrinceJS.pendingSave;
+    let turn = json.prince.turn !== false && !isLoad;
     let direction = json.prince.direction * (json.prince.reverse || 1);
     if (turn) {
       direction = -direction;
@@ -126,8 +131,18 @@ PrinceJS.Game.prototype = {
 
     this.input.keyboard.addKey(Phaser.Keyboard.R).onDown.add(this.restartGameEvent, this);
     this.input.keyboard.addKey(Phaser.Keyboard.A).onDown.add(this.restartLevelEvent, this);
-    this.input.keyboard.addKey(Phaser.Keyboard.L).onDown.add(this.nextLevelEvent, this);
     this.input.keyboard.addKey(Phaser.Keyboard.SPACEBAR).onDown.add(this.showRemainingMinutes, this);
+
+    // S — сохранить игру, L — загрузить игру (Ctrl/Shift+L — следующий уровень).
+    // removeAll() убирает обработчики от предыдущего запуска сцены, чтобы они не дублировались.
+    let sKey = this.input.keyboard.addKey(Phaser.Keyboard.S);
+    sKey.onDown.removeAll();
+    sKey.onDown.add(this.saveGame, this);
+
+    let lKey = this.input.keyboard.addKey(Phaser.Keyboard.L);
+    lKey.onDown.removeAll();
+    lKey.onDown.add(this.nextLevelEvent, this);
+    lKey.onDown.add(this.loadGameEvent, this);
 
     this.input.keyboard.onDownCallback = this.buttonPressed.bind(this);
 
@@ -135,6 +150,14 @@ PrinceJS.Game.prototype = {
     if (PrinceJS.danger === null) {
       PrinceJS.danger = this.level.number === 1 && this.playDanger;
     }
+
+    // Загрузка по L: применяем сохранение после пересоздания уровня и персонажей.
+    if (PrinceJS.pendingSave) {
+      let pendingSave = PrinceJS.pendingSave;
+      PrinceJS.pendingSave = null;
+      this.applySave(pendingSave);
+    }
+
     PrinceJS.Utils.resetFlipScreen();
     PrinceJS.Utils.updateQuery();
   },
@@ -582,6 +605,350 @@ PrinceJS.Game.prototype = {
     return this.ui.isLevelShown();
   },
 
+  getSaveKey: function () {
+    return PrinceJS.Game.SAVE_KEY || "princejs.save.v2";
+  },
+
+  serializeActor: function (actor, extra) {
+    if (!actor) {
+      return null;
+    }
+    let data = {
+      id: actor.id,
+      room: actor.room,
+      x: actor.charX,
+      y: actor.charY,
+      face: actor.charFace,
+      action: actor.action,
+      blockX: actor.charBlockX,
+      blockY: actor.charBlockY
+    };
+    if (extra) {
+      data.health = actor.health;
+      data.maxHealth = actor.maxHealth;
+      data.alive = actor.alive;
+      data.visible = actor.visible;
+      data.active = actor.active;
+      data.sneakUp = actor.sneakUp;
+      data.swordDrawn = actor.swordDrawn;
+      data.hasSword = actor.hasSword;
+    }
+    return data;
+  },
+
+  // Экшены, которые при проигрывании переворачивают персонажа (CMD_ABOUTFACE).
+  // Их нельзя восстанавливать из сохранения: они развернут принца ещё раз
+  // и он начнёт ходить "спиной".
+  UNSAFE_ACTIONS: ["turn", "turndraw", "turnstand", "turnrun", "runturn"],
+
+  // Детерминированно выставляет направление: charFace и зеркалирование спрайта
+  // (а также меча, если он есть) всегда согласованы. В конструкторе Actor
+  // делается `scale.x *= -charFace`, поэтому инвариант — `scale.x === -charFace`.
+  applyActorFace: function (actor, face) {
+    if (!actor || typeof face !== "number" || face === 0) {
+      return;
+    }
+    actor.charFace = face;
+    if (actor.scale) {
+      actor.scale.x = Math.abs(actor.scale.x || 1) * -face;
+    }
+    if (actor.sword && actor.sword.scale) {
+      actor.sword.scale.x = Math.abs(actor.sword.scale.x || 1) * -face;
+    }
+    if (actor.delegate && typeof actor.delegate.syncFace === "function") {
+      actor.delegate.syncFace(actor);
+    }
+  },
+
+  applyActorState: function (actor, data) {
+    if (!actor || !data) {
+      return;
+    }
+    try {
+      if (typeof data.room === "number") {
+        actor.room = data.room;
+      }
+      if (typeof data.x === "number") {
+        actor.charX = data.x;
+      }
+      if (typeof data.y === "number") {
+        actor.charY = data.y;
+      }
+
+      // Направление: не переключаем через changeFace(), а выставляем точно,
+      // вместе с зеркалированием спрайта и меча.
+      this.applyActorFace(actor, data.face);
+
+      if (typeof data.action === "string") {
+        actor.action = this.UNSAFE_ACTIONS.indexOf(data.action) === -1 ? data.action : "stand";
+      }
+
+      // Блоки берём из сохранения: updateBlockXY() здесь вызывать нельзя —
+      // charFdx/charFfoot ещё не соответствуют восстановленному кадру.
+      if (typeof data.blockX === "number") {
+        actor.charBlockX = data.blockX;
+      }
+      if (typeof data.blockY === "number") {
+        actor.charBlockY = data.blockY;
+      }
+
+      if (typeof actor.updateBase === "function") {
+        actor.updateBase();
+      }
+    } catch (e) {
+      console.warn("Failed to apply actor state", e);
+    }
+  },
+
+  saveGame: function (event) {
+    if (event && (event.ctrlKey || event.shiftKey || event.altKey)) {
+      return;
+    }
+    if (this.game.state.getCurrentState() !== this || !this.kid || !this.level) {
+      return;
+    }
+
+    let save = {
+      version: 2,
+      level: PrinceJS.currentLevel,
+      health: this.kid.health,
+      maxHealth: this.kid.maxHealth,
+      strength: PrinceJS.strength,
+      minutes: PrinceJS.Utils.getRemainingMinutes(),
+      screenWidth: PrinceJS.screenWidth,
+      timestamp: Date.now(),
+      kid: this.serializeActor(this.kid, true),
+      enemies: this.enemies.map((enemy) => this.serializeActor(enemy, true)),
+      tiles: {},
+      gates: [],
+      currentRoom: this.currentRoom,
+      currentCameraRoom: this.currentCameraRoom,
+      visitedRooms: this.visitedRooms
+    };
+
+    try {
+      Object.keys(this.level.rooms).forEach((roomKey) => {
+        let room = this.level.rooms[roomKey];
+        if (!room || !room.tiles) {
+          return;
+        }
+        save.tiles[roomKey] = room.tiles.map((tile) => {
+          if (!tile) {
+            return null;
+          }
+          return {
+            e: tile.element,
+            m: tile.modifier,
+            d: !!tile.debris
+          };
+        });
+        room.tiles.forEach((tile) => {
+          if (tile && tile.element === PrinceJS.Level.TILE_GATE) {
+            save.gates.push({
+              room: tile.room,
+              x: tile.roomX,
+              y: tile.roomY,
+              state: tile.state,
+              stuck: tile.stuck,
+              visible: tile.visible
+            });
+          }
+        });
+      });
+    } catch (e) {
+      console.warn("Failed to serialize level", e);
+    }
+
+    try {
+      localStorage.setItem(this.getSaveKey(), JSON.stringify(save));
+      console.log("Game saved", save);
+    } catch (e) {
+      console.warn("Failed to save game", e);
+    }
+  },
+
+  loadGameEvent: function (event) {
+    if (event && (event.ctrlKey || event.shiftKey || event.altKey)) {
+      return;
+    }
+    this.loadGame();
+  },
+
+  loadGame: function () {
+    if (this.game.state.getCurrentState() !== this) {
+      return;
+    }
+
+    let save = null;
+    try {
+      save = JSON.parse(localStorage.getItem(this.getSaveKey()));
+    } catch (e) {
+      save = null;
+    }
+    if (!save || !save.level) {
+      console.warn("No saved game found");
+      return;
+    }
+
+    PrinceJS.currentLevel = save.level;
+    PrinceJS.maxHealth = save.maxHealth || PrinceJS.maxHealth;
+    PrinceJS.currentHealth = Math.min(save.health || PrinceJS.maxHealth, PrinceJS.maxHealth);
+    if (typeof save.strength === "number") {
+      PrinceJS.strength = save.strength;
+    }
+
+    PrinceJS.minutes = typeof save.minutes === "number" ? save.minutes : 60;
+    let date = new Date();
+    date.setMinutes(date.getMinutes() - (60 - PrinceJS.minutes));
+    PrinceJS.startTime = date;
+    PrinceJS.endTime = undefined;
+    PrinceJS.danger = null;
+
+    // Применится в create() после пересоздания уровня.
+    PrinceJS.pendingSave = save;
+
+    console.log("Game loaded", save);
+    this.reset(true);
+  },
+
+  applySave: function (save) {
+    if (!save || save.version !== 2) {
+      return;
+    }
+
+    // Тайлы: элементы, модификаторы, обломки.
+    if (save.tiles) {
+      Object.keys(save.tiles).forEach((roomKey) => {
+        let room = this.level.rooms[roomKey];
+        if (!room || !room.tiles) {
+          return;
+        }
+        let data = save.tiles[roomKey] || [];
+        for (let i = 0; i < data.length && i < room.tiles.length; i++) {
+          let tile = room.tiles[i];
+          let tileData = data[i];
+          if (!tile || !tileData) {
+            continue;
+          }
+          try {
+            let changed = false;
+            if (typeof tileData.m === "number" && tile.modifier !== tileData.m) {
+              tile.modifier = tileData.m;
+              changed = true;
+            }
+            if (typeof tileData.d === "boolean" && !!tile.debris !== tileData.d) {
+              tile.debris = tileData.d;
+              changed = true;
+            }
+            if (typeof tileData.e === "number" && tile.element !== tileData.e) {
+              tile.element = tileData.e;
+              changed = true;
+            }
+            if (changed && typeof tile.revalidate === "function") {
+              tile.revalidate();
+            }
+          } catch (e) {
+            console.warn("Failed to restore tile", e);
+          }
+        }
+      });
+    }
+
+    // Ворота.
+    if (save.gates) {
+      save.gates.forEach((gate) => {
+        let tile = this.level.getTileAt(gate.x, gate.y, gate.room);
+        if (!tile || tile.element !== PrinceJS.Level.TILE_GATE) {
+          return;
+        }
+        try {
+          if (typeof gate.state === "number") {
+            tile.state = gate.state;
+          }
+          if (typeof gate.stuck === "boolean") {
+            tile.stuck = gate.stuck;
+          }
+          if (typeof tile.isVisible === "function") {
+            tile.isVisible(gate.visible !== false);
+          }
+        } catch (e) {
+          console.warn("Failed to restore gate", e);
+        }
+      });
+    }
+
+    // Враги.
+    if (save.enemies && this.enemies) {
+      save.enemies.forEach((data) => {
+        if (!data) {
+          return;
+        }
+        let enemy = this.enemies.find((candidate) => candidate.id === data.id);
+        if (!enemy) {
+          return;
+        }
+        this.applyActorState(enemy, data);
+        if (typeof data.health === "number") {
+          enemy.health = data.health;
+        }
+        if (typeof data.alive === "boolean") {
+          enemy.alive = data.alive;
+        }
+        if (typeof data.visible === "boolean" && typeof enemy.setVisible === "function") {
+          if (data.visible) {
+            enemy.setVisible();
+          } else {
+            enemy.setInvisible();
+          }
+        }
+        if (typeof data.active === "boolean" && typeof enemy.setActive === "function") {
+          if (data.active) {
+            enemy.setActive();
+          } else {
+            enemy.setInactive();
+          }
+        }
+        if (typeof data.sneakUp === "boolean" && typeof enemy.setSneakUp === "function") {
+          enemy.setSneakUp(data.sneakUp);
+        }
+      });
+    }
+
+    // Принц.
+    if (save.kid) {
+      this.applyActorState(this.kid, save.kid);
+      if (typeof save.kid.health === "number") {
+        this.kid.health = save.kid.health;
+      }
+      if (typeof save.kid.maxHealth === "number") {
+        this.kid.maxHealth = save.kid.maxHealth;
+      }
+      if (typeof save.kid.alive === "boolean") {
+        this.kid.alive = save.kid.alive;
+      }
+      if (typeof save.kid.hasSword === "boolean") {
+        this.kid.hasSword = save.kid.hasSword;
+      }
+      if (typeof save.kid.swordDrawn === "boolean") {
+        this.kid.swordDrawn = save.kid.swordDrawn;
+      }
+    }
+
+    // Камера и посещённые комнаты.
+    this.currentRoom = typeof save.currentRoom === "number" ? save.currentRoom : this.kid.room;
+    this.currentCameraRoom =
+      typeof save.currentCameraRoom === "number" ? save.currentCameraRoom : this.currentRoom;
+    this.visitedRooms = save.visitedRooms || {};
+    this.blockCamera = false;
+
+    if (this.level.rooms[this.currentRoom]) {
+      this.setupCamera(this.currentRoom, this.currentCameraRoom);
+    }
+
+    // Не проигрываем вступительные события уровня повторно.
+    this.firstUpdate = false;
+  },
+
   restartGameEvent(event) {
     if (!event.ctrlKey && !event.shiftKey) {
       return;
@@ -857,3 +1224,5 @@ PrinceJS.Game.prototype = {
     }
   }
 };
+
+PrinceJS.Game.SAVE_KEY = "princejs-save";
