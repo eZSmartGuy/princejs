@@ -122,11 +122,19 @@ PrinceJS.Game.prototype = {
     this.ui.setPlayerLive(this.kid);
     this.setupCamera(json.prince.room, json.prince.cameraRoom);
 
+    if (PrinceJS.pendingLoad) {
+      this.applyLoadedState(PrinceJS.pendingLoad);
+      PrinceJS.pendingLoad = null;
+    }
+
     this.game.time.events.loop(80, this.updateWorld, this);
 
     this.input.keyboard.addKey(Phaser.Keyboard.R).onDown.add(this.restartGameEvent, this);
     this.input.keyboard.addKey(Phaser.Keyboard.A).onDown.add(this.restartLevelEvent, this);
-    this.input.keyboard.addKey(Phaser.Keyboard.L).onDown.add(this.nextLevelEvent, this);
+    this.input.keyboard.addKey(Phaser.Keyboard.N).onDown.add(this.nextLevelEvent, this);
+    this.input.keyboard.addKey(Phaser.Keyboard.K).onDown.add(this.killAllEnemies, this);
+    this.input.keyboard.addKey(Phaser.Keyboard.S).onDown.add(this.saveGame, this);
+    this.input.keyboard.addKey(Phaser.Keyboard.L).onDown.add(this.loadGame, this);
     this.input.keyboard.addKey(Phaser.Keyboard.SPACEBAR).onDown.add(this.showRemainingMinutes, this);
 
     this.input.keyboard.onDownCallback = this.buttonPressed.bind(this);
@@ -665,6 +673,269 @@ PrinceJS.Game.prototype = {
 
   handleDead: function () {
     this.continueTimer = 10;
+  },
+
+  killAllEnemies: function () {
+    for (let i = 0; i < this.enemies.length; i++) {
+      let enemy = this.enemies[i];
+      if (enemy.room === this.currentCameraRoom && enemy.alive) {
+        enemy.die();
+      }
+    }
+  },
+
+  saveGame: function (event) {
+    if (event && (event.ctrlKey || event.shiftKey)) {
+      return;
+    }
+    let kid = this.kid;
+    let data = {
+      level: PrinceJS.currentLevel,
+      startTime: PrinceJS.startTime ? PrinceJS.startTime.getTime() : null,
+      kid: {
+        room: kid.room,
+        charX: kid.charX,
+        charY: kid.charY,
+        charFace: kid.charFace,
+        health: kid.health,
+        maxHealth: kid.maxHealth,
+        hasSword: kid.hasSword
+      },
+      enemies: this.enemies.map((enemy) => ({
+        room: enemy.room,
+        charX: enemy.charX,
+        charY: enemy.charY,
+        charFace: enemy.charFace,
+        health: enemy.health,
+        alive: enemy.alive
+      })),
+      world: this.serializeWorld()
+    };
+    try {
+      localStorage.setItem("princejs-save", JSON.stringify(data));
+    } catch (e) {}
+  },
+
+  loadGame: function (event) {
+    if (event && (event.ctrlKey || event.shiftKey)) {
+      return;
+    }
+    let raw;
+    try {
+      raw = localStorage.getItem("princejs-save");
+    } catch (e) {}
+    if (!raw) {
+      return;
+    }
+    let data;
+    try {
+      data = JSON.parse(raw);
+    } catch (e) {
+      return;
+    }
+    PrinceJS.pendingLoad = data;
+    PrinceJS.currentLevel = data.level;
+    PrinceJS.skipShowLevel = true;
+    this.restartLevel(true);
+  },
+
+  applyLoadedState: function (data) {
+    if (data.startTime) {
+      PrinceJS.startTime = new Date(data.startTime);
+    }
+    this.restoreWorld(data.world);
+    let kid = this.kid;
+    let k = data.kid;
+    kid.room = k.room;
+    kid.charX = k.charX;
+    kid.charY = k.charY;
+    if (kid.charFace !== k.charFace) {
+      kid.changeFace();
+    }
+    kid.maxHealth = k.maxHealth;
+    kid.health = k.health;
+    kid.hasSword = k.hasSword;
+    kid.updateBase();
+    kid.action = "stand";
+    PrinceJS.maxHealth = kid.maxHealth;
+    this.ui.setPlayerLive(kid);
+    this.changeRoom(k.room, k.room);
+
+    for (let i = 0; i < this.enemies.length; i++) {
+      let enemy = this.enemies[i];
+      let e = data.enemies[i];
+      if (!e) {
+        continue;
+      }
+      enemy.room = e.room;
+      enemy.charX = e.charX;
+      enemy.charY = e.charY;
+      if (enemy.charFace !== e.charFace) {
+        enemy.changeFace();
+      }
+      enemy.health = e.health;
+      enemy.updateBase();
+      enemy.onInitLife.dispatch(enemy);
+      if (!e.alive && enemy.alive) {
+        enemy.die("dropdead");
+      }
+    }
+  },
+
+  serializeWorld: function () {
+    let level = this.level;
+    let rooms = [];
+    for (let id in level.rooms) {
+      let room = level.rooms[id];
+      if (!room || !room.tiles) {
+        continue;
+      }
+      rooms[id] = room.tiles.map((tile) => this.serializeTile(tile));
+    }
+    return {
+      exitDoorOpen: level.exitDoorOpen,
+      rooms: rooms,
+      trobs: level.trobs.map((trob) => this.serializeTile(trob))
+    };
+  },
+
+  serializeTile: function (tile) {
+    if (!tile || typeof tile.element === "undefined") {
+      return null;
+    }
+    let state = {
+      e: tile.element,
+      m: tile.modifier
+    };
+    [
+      "state",
+      "step",
+      "active",
+      "posY",
+      "debris",
+      "tick",
+      "specialModifier",
+      "mortal",
+      "closedFast",
+      "vacc",
+      "yTo",
+      "offsetY",
+      "fall",
+      "sound",
+      "frontOriginalY"
+    ].forEach((key) => {
+      if (typeof tile[key] !== "undefined") {
+        state[key] = tile[key];
+      }
+    });
+    if (tile.back) {
+      state.by = tile.back.y;
+      state.bf = tile.back.frameName;
+    }
+    if (tile.front) {
+      state.fy = tile.front.y;
+      state.ff = tile.front.frameName;
+    }
+    if (typeof tile.roomX !== "undefined") {
+      state.rx = tile.roomX;
+      state.ry = tile.roomY;
+      state.r = tile.room;
+    }
+    return state;
+  },
+
+  restoreTile: function (tile, state) {
+    if (!tile || !state) {
+      return;
+    }
+    if (state.e !== tile.element && typeof tile.removeObject === "function") {
+      tile.removeObject();
+    }
+    tile.element = state.e;
+    tile.modifier = state.m;
+
+    [
+      "state",
+      "step",
+      "active",
+      "posY",
+      "debris",
+      "tick",
+      "specialModifier",
+      "mortal",
+      "closedFast",
+      "vacc",
+      "yTo",
+      "offsetY",
+      "fall",
+      "sound"
+    ].forEach((key) => {
+      if (typeof state[key] !== "undefined") {
+        tile[key] = state[key];
+      }
+    });
+    if (typeof state.frontOriginalY !== "undefined") {
+      tile.frontOriginalY = state.frontOriginalY;
+    }
+    if (tile.back && typeof state.by !== "undefined") {
+      tile.back.y = state.by;
+    }
+    if (tile.front && typeof state.fy !== "undefined") {
+      tile.front.y = state.fy;
+    }
+    if (tile.back && state.bf) {
+      tile.back.frameName = state.bf;
+    }
+    if (tile.front && state.ff) {
+      tile.front.frameName = state.ff;
+    }
+
+    if (tile.tileChildBack && tile.tileChildFront && typeof state.posY !== "undefined") {
+      let posY = tile.posY;
+      if (posY === 0) {
+        tile.tileChildBack.crop(null);
+        tile.tileChildFront.crop(null);
+      } else {
+        tile.tileChildBack.crop(
+          new Phaser.Rectangle(0, -posY, tile.tileChildBack.width, tile.tileChildBack.height + posY)
+        );
+        tile.tileChildFront.crop(
+          new Phaser.Rectangle(0, -posY, tile.tileChildFront.width, tile.tileChildFront.height + posY)
+        );
+      }
+    }
+
+    if (tile.tileChildBack && tile.tileChildFront && state.e === PrinceJS.Level.TILE_SPIKES) {
+      let frame = Math.max(0, Math.min(5, tile.step || 0));
+      tile.tileChildBack.frameName = tile.key + "_" + PrinceJS.Level.TILE_SPIKES + "_" + frame;
+      tile.tileChildFront.frameName = tile.key + "_" + PrinceJS.Level.TILE_SPIKES + "_" + frame + "_fg";
+    }
+  },
+
+  restoreWorld: function (data) {
+    if (!data || !this.level) {
+      return;
+    }
+    let level = this.level;
+    level.exitDoorOpen = !!data.exitDoorOpen;
+    if (data.rooms) {
+      for (let id = 0; id < data.rooms.length; id++) {
+        let room = level.rooms[id];
+        let saved = data.rooms[id];
+        if (!room || !room.tiles || !saved) {
+          continue;
+        }
+        for (let i = 0; i < saved.length; i++) {
+          this.restoreTile(room.tiles[i], saved[i]);
+        }
+      }
+    }
+    if (data.trobs) {
+      for (let i = 0; i < data.trobs.length; i++) {
+        this.restoreTile(level.trobs[i], data.trobs[i]);
+      }
+    }
+    level.recheckCurrentRoom();
   },
 
   handleFlipped: function () {
